@@ -19,7 +19,7 @@ DEPS_PATH    = os.path.join(ROOT, "ai_inputs", "dependencies.json")
 # ── LLM Config ───────────────────────────────────────────────────────────────
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-MODEL              = "deepseek/deepseek-r1"
+MODEL              = "deepseek/deepseek-r1:free"
 TIMEOUT      = 60
 
 # ── Priority order for categories ────────────────────────────────────────────
