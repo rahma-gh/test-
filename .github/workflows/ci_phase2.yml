@@ -1,4 +1,4 @@
-name: CI Phase 2 — AI Pipeline (Groq + Llama3.3-70b)
+name: CI Phase 2 — AI Pipeline 
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 jobs:
 
   ai-test-pipeline:
-    name: "AI Pipeline — Selection & Prioritization by Llama3.3-70b (Groq)"
+    name: "AI Pipeline — Selection & Prioritization"
     runs-on: ubuntu-22.04
 
     steps:
