@@ -1,0 +1,176 @@
+name: CI Phase 2 — AI Pipeline (Groq + Llama3.3-70b)
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+
+  ai-test-pipeline:
+    name: "AI Pipeline — Selection & Prioritization by Llama3.3-70b (Groq)"
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      # ── STEP 1 : Checkout ─────────────────────────────────────────────────
+      - name: "Checkout code (full history for git diff)"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # ── STEP 2 : Python setup ─────────────────────────────────────────────
+      - name: "Setup Python 3.10"
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: "Install Python dependencies"
+        run: pip install pytest pytest-html requests pytest-json-report
+
+      # ── STEP 3 : Generate LLM inputs ──────────────────────────────────────
+      - name: "Generate git_diff.txt and test_history.txt"
+        run: python prepare_inputs.py
+
+      - name: "Preview inputs before sending to LLM"
+        run: |
+          echo "════════════════════════════════════════════════"
+          echo "  INPUT 1 — git_diff.txt"
+          echo "════════════════════════════════════════════════"
+          cat ai_inputs/git_diff.txt
+          echo ""
+          echo "════════════════════════════════════════════════"
+          echo "  INPUT 3 — test_history.txt (first 20 lines)"
+          echo "════════════════════════════════════════════════"
+          head -20 ai_inputs/test_history.txt
+          echo ""
+          echo "  File sizes:"
+          wc -l ai_inputs/git_diff.txt ai_inputs/test_history.txt ai_inputs/dependencies.json
+
+      # ── STEP 4 : Call Groq LLM ────────────────────────────────────────────
+      - name: "Call LLM — Selection & Prioritization (Groq API)"
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python ai_test_selector.py
+
+      - name: "Display LLM selection result"
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          with open("ai_inputs/selected_tests.json") as f:
+              result = json.load(f)
+          print(f"Changed element  : {result.get('changed_element', '?')}")
+          print(f"Reasoning        : {result.get('reasoning_summary', '?')}")
+          print(f"Total selected   : {result['total_selected']} tests\n")
+          print(f"{'#':<4} {'TEST_ID':<55} {'CATEGORY':<15} REASON")
+          print("-" * 100)
+          for t in result["selected_tests"]:
+              print(f"{t['priority']:<4} {t['test_id']:<55} {t['category']:<15} {t.get('reason','')}")
+          PYEOF
+
+      # ── STEP 5 : Resolve test file paths ──────────────────────────────────
+      - name: "Resolve selected test file paths"
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          from pathlib import Path
+
+          with open("ai_inputs/selected_tests.json") as f:
+              result = json.load(f)
+
+          test_dir = Path("tests")
+          paths, not_found = [], []
+
+          for entry in result["selected_tests"]:
+              tid     = entry["test_id"]
+              matches = list(test_dir.rglob(f"{tid}.py"))
+              if matches:
+                  paths.append(str(matches[0]))
+              else:
+                  not_found.append(tid)
+
+          if not_found:
+              print(f"WARNING — Tests not found: {not_found}")
+
+          with open("ai_inputs/selected_test_paths.txt", "w") as f:
+              f.write(" ".join(paths))
+
+          print(f"{len(paths)} test paths resolved:")
+          for p in paths:
+              print(f"  {p}")
+          PYEOF
+
+      # ── STEP 6 : Build Docker image ───────────────────────────────────────
+      - name: "Build Docker image (Webots simulation)"
+        run: docker build -t ur-simulation .
+
+      # ── STEP 7 : Run simulation + selected tests ───────────────────────────
+      - name: "Run Webots simulation then selected tests"
+        run: |
+          # Read selected paths and pass them into Docker via env variable
+          SELECTED_PATHS=$(cat ai_inputs/selected_test_paths.txt)
+          echo "Tests to run: $SELECTED_PATHS"
+
+          docker run --name ur-test-ai \
+            -e SELECTED_PATHS="$SELECTED_PATHS" \
+            ur-simulation bash -c "
+            export DISPLAY=:99
+            Xvfb :99 -screen 0 1280x1024x24 -ac +extension GLX +render -noreset &
+            sleep 3
+
+            webots --mode=fast --batch --no-rendering worlds/ure.wbt \
+                1>/app/reports/webots_stdout.log \
+                2>/app/reports/webots_stderr.log &
+            WEBOTS_PID=\$!
+
+            echo 'Waiting for simulation to complete...'
+            WAITED=0
+            while [ \$WAITED -lt 270 ]; do
+              sleep 5
+              WAITED=\$((WAITED + 5))
+              if [ -f /app/reports/simulation_results.json ]; then
+                DONE=\$(python3 -c \"import json; d=json.load(open('/app/reports/simulation_results.json')); print(d.get('sequence_complete', False))\" 2>/dev/null)
+                echo \"[\${WAITED}s] sequence_complete=\${DONE}\"
+                [ \"\$DONE\" = \"True\" ] && break
+              else
+                echo \"[\${WAITED}s] simulation_results.json not yet created...\"
+              fi
+              kill -0 \$WEBOTS_PID 2>/dev/null || break
+            done
+
+            kill \$WEBOTS_PID 2>/dev/null || true
+            sleep 2
+
+            echo \"Running selected tests: \$SELECTED_PATHS\"
+            pytest \$SELECTED_PATHS -v \
+              --html=/app/reports/report_ai.html \
+              --self-contained-html \
+              --json-report \
+              --json-report-file=/app/reports/test_results.json || true
+          "
+        continue-on-error: true
+
+      # ── STEP 8 : Collect reports from Docker ──────────────────────────────
+      - name: "Collect reports from Docker container"
+        if: always()
+        run: |
+          mkdir -p reports_ai
+          docker cp ur-test-ai:/app/reports/. reports_ai/
+
+      # ── STEP 9 : Upload artifacts ──────────────────────────────────────────
+      - name: "Upload — LLM inputs"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llm-inputs
+          path: |
+            ai_inputs/git_diff.txt
+            ai_inputs/test_history.txt
+            ai_inputs/dependencies.json
+            ai_inputs/selected_tests.json
+
+      - name: "Upload — AI test report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ai-test-report
+          path: reports_ai/
